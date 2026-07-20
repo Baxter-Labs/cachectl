@@ -1,0 +1,687 @@
+#!/bin/bash
+#
+# cachectl - inspect and reclaim developer cache space on macOS
+#
+# Safety model:
+#   * Nothing is ever deleted unless you pass --apply.
+#   * Every target has a risk tier: safe | review | risky.
+#   * `clean` only touches `safe` targets unless you opt in explicitly.
+#   * Deletion paths are validated against an allowlist of prefixes before
+#     anything is removed. A target that fails validation is skipped loudly.
+#
+set -uo pipefail
+
+VERSION="1.0.0"
+SELF="$(basename "$0")"
+
+# ---------------------------------------------------------------- formatting --
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+  BOLD="$(tput bold)"; DIM="$(tput dim)"; RED="$(tput setaf 1)"; GREEN="$(tput setaf 2)"
+  YELLOW="$(tput setaf 3)"; BLUE="$(tput setaf 4)"; RESET="$(tput sgr0)"
+else
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; RESET=""
+fi
+
+info()  { printf '%s\n' "$*" >&2; }
+warn()  { printf '%s%s%s\n' "$YELLOW" "$*" "$RESET" >&2; }
+err()   { printf '%s%s%s\n' "$RED" "$*" "$RESET" >&2; }
+die()   { err "$*"; exit 1; }
+
+# Convert kilobytes to a human string.
+human() {
+  local kb="$1"
+  if [ "$kb" -lt 1024 ]; then printf '%d KB' "$kb"
+  elif [ "$kb" -lt 1048576 ]; then printf '%.1f MB' "$(echo "$kb" | awk '{print $1/1024}')"
+  else printf '%.2f GB' "$(echo "$kb" | awk '{print $1/1048576}')"
+  fi
+}
+
+risk_color() {
+  case "$1" in
+    safe)   printf '%s' "$GREEN" ;;
+    review) printf '%s' "$YELLOW" ;;
+    risky)  printf '%s' "$RED" ;;
+    *)      printf '%s' "$RESET" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ measuring --
+
+NOW="$(date +%s)"
+
+# Apparent disk usage in KB. Missing path -> 0.
+size_kb() {
+  local p="$1"
+  [ -e "$p" ] || { echo 0; return; }
+  du -sk "$p" 2>/dev/null | awk 'NR==1{print $1+0}' || echo 0
+}
+
+# Whole days since the path was last modified. Missing path -> -1.
+age_days() {
+  local p="$1" m
+  [ -e "$p" ] || { echo -1; return; }
+  m="$(stat -f %m "$p" 2>/dev/null)" || { echo -1; return; }
+  echo $(( (NOW - m) / 86400 ))
+}
+
+# -------------------------------------------------------------------- targets --
+
+# Record layout, pipe delimited:
+#   id | category | risk | path | cleaner | description
+#
+# cleaner is "-" to mean "remove the directory and recreate it empty", or a
+# shell command to run instead (used where the tool ships its own GC and
+# deleting by hand would corrupt state).
+#
+# risk tiers:
+#   safe   - regenerated automatically, no user data, no network cost beyond redownload
+#   review - safe to lose but expensive to rebuild, or may hold something you want
+#   risky  - can destroy real artifacts / require reinstall; never auto-selected
+targets() {
+  local H="$HOME"
+  cat <<EOF
+npm|node|safe|$H/.npm/_cacache|-|npm package cache
+yarn|node|safe|$H/Library/Caches/Yarn|-|Yarn v1 cache
+yarn-berry|node|safe|$H/.yarn/berry/cache|-|Yarn Berry global cache
+pnpm|node|safe|$H/Library/pnpm/store|-|pnpm content-addressable store
+pnpm-alt|node|safe|$H/.pnpm-store|-|pnpm store (legacy location)
+bun|node|safe|$H/.bun/install/cache|-|Bun install cache
+node-gyp|node|safe|$H/Library/Caches/node-gyp|-|node-gyp downloaded headers
+electron|node|safe|$H/Library/Caches/electron|-|Electron binary downloads
+puppeteer|node|review|$H/.cache/puppeteer|-|Puppeteer Chromium builds (redownloads on next run)
+playwright|node|review|$H/Library/Caches/ms-playwright|-|Playwright browser builds (re-run 'playwright install')
+pip|python|safe|$H/Library/Caches/pip|-|pip wheel/http cache
+uv|python|safe|$H/.cache/uv|-|uv package cache
+poetry|python|safe|$H/Library/Caches/pypoetry|-|Poetry artifact cache
+pyenv-build|python|safe|$H/.pyenv/cache|-|pyenv source tarballs
+huggingface|python|review|$H/.cache/huggingface|-|Hugging Face model/dataset cache (large redownloads)
+torch|python|review|$H/.cache/torch|-|PyTorch downloaded weights
+cargo-registry|rust|safe|$H/.cargo/registry|-|Cargo crate registry cache
+cargo-git|rust|safe|$H/.cargo/git|-|Cargo git checkouts
+sccache|rust|safe|$H/Library/Caches/Mozilla.sccache|-|sccache compiler cache
+go-build|go|safe|$H/Library/Caches/go-build|-|Go build cache
+go-mod|go|review|$H/go/pkg/mod|go clean -modcache|Go module cache (redownloads on next build)
+gradle|jvm|safe|$H/.gradle/caches|-|Gradle build/dependency cache
+maven|jvm|review|$H/.m2/repository|-|Maven local repo (may hold locally-installed artifacts)
+sbt|jvm|safe|$H/.sbt/boot|-|sbt boot cache
+coursier|jvm|safe|$H/Library/Caches/Coursier|-|Coursier/Scala dependency cache
+nuget|dotnet|safe|$H/.nuget/packages|-|NuGet global packages
+dotnet-tmp|dotnet|safe|$H/.dotnet/optimizationdata|-|.NET optimization data
+composer|php|safe|$H/.composer/cache|-|Composer cache
+composer-xdg|php|safe|$H/.cache/composer|-|Composer cache (XDG location)
+bundler|ruby|review|$H/.bundle/cache|-|Bundler gem cache
+gem-spec|ruby|safe|$H/.gem/specs|-|RubyGems spec cache
+cocoapods|apple|safe|$H/Library/Caches/CocoaPods|-|CocoaPods spec + pod cache
+carthage|apple|safe|$H/Library/Caches/org.carthage.CarthageKit|-|Carthage cache
+spm|apple|safe|$H/Library/Caches/org.swift.swiftpm|-|Swift Package Manager cache
+derived-data|apple|safe|$H/Library/Developer/Xcode/DerivedData|-|Xcode DerivedData (rebuilt on next build)
+xcode-devicesupport|apple|review|$H/Library/Developer/Xcode/iOS DeviceSupport|-|Xcode iOS symbols (re-created when you reattach a device)
+xcode-watchsupport|apple|review|$H/Library/Developer/Xcode/watchOS DeviceSupport|-|Xcode watchOS symbols
+xcode-previews|apple|safe|$H/Library/Developer/Xcode/UserData/Previews|-|SwiftUI preview cache
+simulator-caches|apple|safe|$H/Library/Developer/CoreSimulator/Caches|-|CoreSimulator caches
+simulator-unavailable|apple|review|$H/Library/Developer/CoreSimulator/Devices|xcrun simctl delete unavailable|Orphaned simulators (SIZE SHOWN = all simulators; only unavailable ones are removed)
+xcode-archives|apple|risky|$H/Library/Developer/Xcode/Archives|-|Xcode archives — these are shippable builds, keep what you need
+android-cache|android|safe|$H/.android/cache|-|Android SDK cache
+android-build-cache|android|safe|$H/.android/build-cache|-|Android build cache
+avd|android|risky|$H/.android/avd|-|Android emulator images — deletes your virtual devices
+homebrew|system|safe|$H/Library/Caches/Homebrew|brew cleanup -s|Homebrew downloads + old versions
+deno|other|safe|$H/Library/Caches/deno|-|Deno dependency cache
+terraform|other|review|$H/.terraform.d/plugin-cache|-|Terraform provider plugin cache
+docker|other|risky|$H/Library/Containers/com.docker.docker/Data|docker system prune -a -f --volumes|Docker prune (SIZE SHOWN = whole Docker disk; prune removes unused images/volumes only)
+user-logs|system|review|$H/Library/Logs|-|Application logs
+crash-reports|system|review|$H/Library/Logs/DiagnosticReports|-|Crash reports
+EOF
+}
+
+lookup_target() {
+  local want="$1"
+  targets | awk -F'|' -v id="$want" '$1==id {print; exit}'
+}
+
+# ------------------------------------------------------------ delete guardrail --
+
+# A path must sit under one of these prefixes to be eligible for removal.
+path_allowed() {
+  local p="$1"
+  case "$p" in
+    "$HOME"/Library/Caches/*|"$HOME"/Library/Developer/*|"$HOME"/Library/Logs*|\
+    "$HOME"/Library/pnpm/*|"$HOME"/Library/Containers/com.docker.docker/*|\
+    "$HOME"/.*/*|"$HOME"/.[!.]*|"$HOME"/go/pkg/*)
+      ;;
+    *) return 1 ;;
+  esac
+  # Reject anything that resolves to a boundary we must never remove.
+  case "$p" in
+    "$HOME"|"$HOME"/|/|""|/Users|/Users/) return 1 ;;
+  esac
+  # Reject traversal.
+  case "$p" in *..*) return 1 ;; esac
+  return 0
+}
+
+trash_path() {
+  local p="$1"
+  osascript -e "tell application \"Finder\" to delete POSIX file \"$p\"" >/dev/null 2>&1
+}
+
+# ----------------------------------------------------------------------- scan --
+
+# Populates SCAN_ROWS with "id|risk|kb|age|category|desc" for matching targets.
+SCAN_ROWS=""
+SCAN_TOTAL_SAFE=0
+SCAN_TOTAL_ALL=0
+
+run_scan() {
+  local filter_cat="$1" filter_ids="$2" min_kb="$3" stale_days="$4"
+  local rec id cat risk path cleaner desc kb age
+
+  SCAN_ROWS=""; SCAN_TOTAL_SAFE=0; SCAN_TOTAL_ALL=0
+
+  while IFS='|' read -r id cat risk path cleaner desc; do
+    [ -n "${id:-}" ] || continue
+    if [ -n "$filter_cat" ] && [ "$cat" != "$filter_cat" ]; then continue; fi
+    if [ -n "$filter_ids" ] && ! printf '%s\n' "$filter_ids" | tr ',' '\n' | grep -qx "$id"; then continue; fi
+    [ -e "$path" ] || continue
+
+    printf '\r%s  scanning %-34s%s' "$DIM" "$id" "$RESET" >&2
+    kb="$(size_kb "$path")"
+    age="$(age_days "$path")"
+
+    [ "$kb" -ge "$min_kb" ] || continue
+    if [ "$stale_days" -gt 0 ] && [ "$age" -lt "$stale_days" ]; then continue; fi
+
+    SCAN_ROWS="${SCAN_ROWS}${id}|${risk}|${kb}|${age}|${cat}|${desc}
+"
+    SCAN_TOTAL_ALL=$(( SCAN_TOTAL_ALL + kb ))
+    [ "$risk" = "safe" ] && SCAN_TOTAL_SAFE=$(( SCAN_TOTAL_SAFE + kb ))
+  done <<EOF
+$(targets)
+EOF
+  printf '\r%*s\r' 60 '' >&2
+}
+
+print_scan_table() {
+  local sort_key="$1"
+  local id risk kb age cat desc c
+
+  printf '%s%-24s %12s %7s %-7s %-9s %s%s\n' "$BOLD" "ID" "SIZE" "AGE" "RISK" "GROUP" "WHAT IT IS" "$RESET"
+  printf '%s%s%s\n' "$DIM" "$(printf '%.0s-' $(seq 1 100))" "$RESET"
+
+  printf '%s' "$SCAN_ROWS" | sort -t'|' -k"$sort_key" -rn | while IFS='|' read -r id risk kb age cat desc; do
+    [ -n "${id:-}" ] || continue
+    c="$(risk_color "$risk")"
+    printf '%-24s %12s %6sd %s%-7s%s %-9s %s%s%s\n' \
+      "$id" "$(human "$kb")" "$age" "$c" "$risk" "$RESET" "$cat" "$DIM" "$desc" "$RESET"
+  done
+}
+
+cmd_scan() {
+  local filter_cat="" filter_ids="" min_kb=0 stale_days=0 sort_key=3
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --category) filter_cat="$2"; shift 2 ;;
+      --only) filter_ids="$2"; shift 2 ;;
+      --min-size) min_kb="$(mb_to_kb "$2")"; shift 2 ;;
+      --stale-days) stale_days="$2"; shift 2 ;;
+      --by-age) sort_key=4; shift ;;
+      *) die "scan: unknown flag $1" ;;
+    esac
+  done
+
+  info "${BOLD}Scanning developer caches...${RESET}"
+  run_scan "$filter_cat" "$filter_ids" "$min_kb" "$stale_days"
+
+  if [ -z "$SCAN_ROWS" ]; then
+    info "No matching caches found."
+    return 0
+  fi
+
+  echo
+  print_scan_table "$sort_key"
+  echo
+  printf '%sReclaimable now (risk=safe): %s%s%s\n' "$BOLD" "$GREEN" "$(human "$SCAN_TOTAL_SAFE")" "$RESET"
+  printf '%sAll listed caches:            %s%s\n' "$BOLD" "$(human "$SCAN_TOTAL_ALL")" "$RESET"
+  echo
+  printf '%sNext: %s clean            # dry run, safe targets only\n' "$DIM" "$SELF"
+  printf '      %s clean --apply    # actually delete%s\n' "$SELF" "$RESET"
+}
+
+mb_to_kb() { echo "$1" | awk '{printf "%d", $1*1024}'; }
+
+# ---------------------------------------------------------------------- clean --
+
+cmd_clean() {
+  local apply=0 use_trash=0 include_review=0 include_risky=0 assume_yes=0
+  local filter_cat="" filter_ids="" min_kb=0 stale_days=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1; shift ;;
+      --trash) use_trash=1; shift ;;
+      --include-review) include_review=1; shift ;;
+      --include-risky) include_risky=1; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      --category) filter_cat="$2"; shift 2 ;;
+      --only) filter_ids="$2"; include_review=1; include_risky=1; shift 2 ;;
+      --min-size) min_kb="$(mb_to_kb "$2")"; shift 2 ;;
+      --stale-days) stale_days="$2"; shift 2 ;;
+      *) die "clean: unknown flag $1" ;;
+    esac
+  done
+
+  [ "$include_risky" -eq 1 ] && [ "$assume_yes" -eq 0 ] && [ "$apply" -eq 1 ] && \
+    die "--include-risky with --apply also requires --yes (risky targets can destroy build artifacts)."
+
+  info "${BOLD}Scanning...${RESET}"
+  run_scan "$filter_cat" "$filter_ids" "$min_kb" "$stale_days"
+  [ -n "$SCAN_ROWS" ] || { info "Nothing to clean."; return 0; }
+
+  # Build the selected set.
+  local selected="" id risk kb age cat desc total=0
+  while IFS='|' read -r id risk kb age cat desc; do
+    [ -n "${id:-}" ] || continue
+    case "$risk" in
+      safe)   ;;
+      review) [ "$include_review" -eq 1 ] || continue ;;
+      risky)  [ "$include_risky" -eq 1 ] || continue ;;
+    esac
+    selected="${selected}${id}|${risk}|${kb}
+"
+    total=$(( total + kb ))
+  done <<EOF
+$(printf '%s' "$SCAN_ROWS")
+EOF
+
+  [ -n "$selected" ] || { info "Nothing selected. Try --include-review."; return 0; }
+
+  echo
+  if [ "$apply" -eq 0 ]; then
+    printf '%s DRY RUN — nothing will be deleted %s\n' "${BOLD}${BLUE}" "$RESET"
+  else
+    printf '%s APPLYING — these will be removed %s\n' "${BOLD}${RED}" "$RESET"
+  fi
+  echo
+
+  local rec path cleaner c
+  printf '%s' "$selected" | sort -t'|' -k3 -rn | while IFS='|' read -r id risk kb; do
+    [ -n "${id:-}" ] || continue
+    rec="$(lookup_target "$id")"
+    path="$(printf '%s' "$rec" | cut -d'|' -f4)"
+    c="$(risk_color "$risk")"
+    printf '  %s%-7s%s %-24s %12s  %s\n' "$c" "$risk" "$RESET" "$id" "$(human "$kb")" "$DIM$path$RESET"
+  done
+
+  echo
+  printf '%sTotal to reclaim: %s%s%s\n\n' "$BOLD" "$GREEN" "$(human "$total")" "$RESET"
+
+  if [ "$apply" -eq 0 ]; then
+    printf '%sRe-run with --apply to delete. Add --trash to move to Trash instead (reversible, slower).%s\n' "$DIM" "$RESET"
+    return 0
+  fi
+
+  if [ "$assume_yes" -eq 0 ]; then
+    printf 'Proceed? [y/N] '
+    local ans; read -r ans
+    case "$ans" in y|Y|yes|YES) ;; *) info "Aborted."; return 1 ;; esac
+  fi
+
+  local freed=0
+  while IFS='|' read -r id risk kb; do
+    [ -n "${id:-}" ] || continue
+    rec="$(lookup_target "$id")"
+    path="$(printf '%s' "$rec" | cut -d'|' -f4)"
+    cleaner="$(printf '%s' "$rec" | cut -d'|' -f5)"
+
+    if [ "$cleaner" != "-" ]; then
+      printf '  %s->%s %s  (%s)\n' "$BLUE" "$RESET" "$id" "$cleaner"
+      if sh -c "$cleaner" >/dev/null 2>&1; then
+        freed=$(( freed + kb ))
+      else
+        warn "     cleaner failed for $id, left untouched"
+      fi
+      continue
+    fi
+
+    if ! path_allowed "$path"; then
+      warn "  !! refusing to delete '$path' (outside allowlist) — skipped"
+      continue
+    fi
+    [ -e "$path" ] || continue
+
+    printf '  %s->%s %s  %s\n' "$BLUE" "$RESET" "$id" "$DIM$path$RESET"
+    if [ "$use_trash" -eq 1 ]; then
+      if trash_path "$path"; then freed=$(( freed + kb )); else warn "     could not move to Trash — skipped"; fi
+    else
+      if rm -rf -- "$path"; then
+        mkdir -p -- "$path" 2>/dev/null || true
+        freed=$(( freed + kb ))
+      else
+        warn "     rm failed — skipped"
+      fi
+    fi
+  done <<EOF
+$(printf '%s' "$selected" | sort -t'|' -k3 -rn)
+EOF
+
+  echo
+  printf '%sFreed: %s%s\n' "$BOLD$GREEN" "$(human "$freed")" "$RESET"
+}
+
+# ------------------------------------------------------------------- projects --
+
+# Find stale build/dependency directories inside project trees. These are the
+# ones that quietly eat the most space and nobody ever looks at.
+#
+# Populates PROJ_ROWS ("kb|age|path"), PROJ_TOTAL, PROJ_COUNT.
+PROJ_ROWS=""; PROJ_TOTAL=0; PROJ_COUNT=0
+
+scan_projects() {
+  local root="$1" stale_days="$2" min_kb="$3" depth="$4"
+  PROJ_ROWS=""; PROJ_TOTAL=0; PROJ_COUNT=0
+
+  local names="node_modules .next .nuxt dist build target .turbo .parcel-cache .venv venv __pycache__ .pytest_cache .mypy_cache .gradle DerivedData vendor/bundle .terraform"
+  local n find_expr=""
+  for n in $names; do
+    find_expr="$find_expr -o -name $n"
+  done
+  find_expr="${find_expr# -o }"
+
+  local tmp; tmp="$(mktemp -t cachectl)" || die "mktemp failed"
+  # -prune stops us from descending into a match (no node_modules inside node_modules).
+  # shellcheck disable=SC2086
+  find "$root" -maxdepth "$depth" \( $find_expr \) -type d -prune -print 2>/dev/null > "$tmp"
+
+  local p kb age
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    age="$(age_days "$p")"
+    [ "$age" -ge "$stale_days" ] || continue
+    printf '\r%s  measuring %-50.50s%s' "$DIM" "$(basename "$(dirname "$p")")/$(basename "$p")" "$RESET" >&2
+    kb="$(size_kb "$p")"
+    [ "$kb" -ge "$min_kb" ] || continue
+    PROJ_ROWS="${PROJ_ROWS}${kb}|${age}|${p}
+"
+    PROJ_TOTAL=$(( PROJ_TOTAL + kb )); PROJ_COUNT=$(( PROJ_COUNT + 1 ))
+  done < "$tmp"
+  rm -f "$tmp"
+  printf '\r%*s\r' 70 '' >&2
+}
+
+cmd_projects() {
+  local root="$HOME" stale_days=30 min_kb=51200 apply=0 use_trash=0 assume_yes=0 depth=6
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) root="$2"; shift 2 ;;
+      --stale-days) stale_days="$2"; shift 2 ;;
+      --min-size) min_kb="$(mb_to_kb "$2")"; shift 2 ;;
+      --depth) depth="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      --trash) use_trash=1; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      *) die "projects: unknown flag $1" ;;
+    esac
+  done
+
+  [ -d "$root" ] || die "not a directory: $root"
+  case "$root" in "$HOME"*|/Users/*|/Volumes/*) ;; *) die "refusing to scan outside \$HOME, /Users or /Volumes";; esac
+
+  info "${BOLD}Looking for build dirs under $root${RESET} ${DIM}(untouched >${stale_days}d, >$(human "$min_kb"), depth<=$depth)${RESET}"
+
+  scan_projects "$root" "$stale_days" "$min_kb" "$depth"
+  local rows="$PROJ_ROWS" total="$PROJ_TOTAL" count="$PROJ_COUNT"
+  local kb age p
+
+  [ -n "$rows" ] || { info "Nothing stale enough to report."; return 0; }
+
+  echo
+  printf '%s%12s %7s  %s%s\n' "$BOLD" "SIZE" "AGE" "PATH" "$RESET"
+  printf '%s%s%s\n' "$DIM" "$(printf '%.0s-' $(seq 1 90))" "$RESET"
+  printf '%s' "$rows" | sort -t'|' -k1 -rn | while IFS='|' read -r kb age p; do
+    [ -n "${kb:-}" ] || continue
+    printf '%12s %6sd  %s\n' "$(human "$kb")" "$age" "$p"
+  done
+  echo
+  printf '%s%d dirs, %s reclaimable%s\n\n' "$BOLD" "$count" "$(human "$total")" "$RESET"
+
+  if [ "$apply" -eq 0 ]; then
+    printf '%sDry run. Re-run with --apply to delete these.%s\n' "$DIM" "$RESET"
+    printf '%sNote: reinstalling deps (npm i, cargo build, ...) recreates them.%s\n' "$DIM" "$RESET"
+    return 0
+  fi
+
+  if [ "$assume_yes" -eq 0 ]; then
+    printf '%sDelete all %d directories above? [y/N] %s' "$BOLD" "$count" "$RESET"
+    local ans; read -r ans
+    case "$ans" in y|Y|yes|YES) ;; *) info "Aborted."; return 1 ;; esac
+  fi
+
+  local freed=0
+  while IFS='|' read -r kb age p; do
+    [ -n "${p:-}" ] || continue
+    case "$p" in "$HOME"|/|/Users|/Users/*/) warn "  !! skipping $p"; continue ;; esac
+    printf '  %s->%s %s\n' "$BLUE" "$RESET" "$p"
+    if [ "$use_trash" -eq 1 ]; then
+      trash_path "$p" && freed=$(( freed + kb )) || warn "     Trash move failed"
+    else
+      rm -rf -- "$p" && freed=$(( freed + kb )) || warn "     rm failed"
+    fi
+  done <<EOF
+$(printf '%s' "$rows" | sort -t'|' -k1 -rn)
+EOF
+
+  echo
+  printf '%sFreed: %s%s\n' "$BOLD$GREEN" "$(human "$freed")" "$RESET"
+}
+
+# --------------------------------------------------------------------- report --
+
+# The whole picture in one pass: tool caches, stale project dirs, and unknown
+# cache entries — with a single grand total and an ordered list of what to do.
+cmd_report() {
+  local root="$HOME" stale_days=30 min_kb=51200 depth=6 skip_projects=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) root="$2"; shift 2 ;;
+      --stale-days) stale_days="$2"; shift 2 ;;
+      --min-size) min_kb="$(mb_to_kb "$2")"; shift 2 ;;
+      --depth) depth="$2"; shift 2 ;;
+      --no-projects) skip_projects=1; shift ;;
+      *) die "report: unknown flag $1" ;;
+    esac
+  done
+
+  local free_kb; free_kb="$(df -k / 2>/dev/null | awk 'NR==2{print $4+0}')"
+
+  printf '\n%s  cachectl disk report%s\n' "$BOLD" "$RESET"
+  printf '%s  free space on /: %s%s\n\n' "$DIM" "$(human "${free_kb:-0}")" "$RESET"
+
+  # --- 1. tool caches -------------------------------------------------------
+  info "${BOLD}[1/3] Tool caches${RESET}"
+  run_scan "" "" 0 0
+  local cache_safe="$SCAN_TOTAL_SAFE" cache_all="$SCAN_TOTAL_ALL" cache_rows="$SCAN_ROWS"
+
+  if [ -n "$cache_rows" ]; then
+    echo
+    print_scan_table 3
+  else
+    info "  none found"
+  fi
+
+  # --- 2. stale project dirs -----------------------------------------------
+  local proj_total=0 proj_count=0 proj_rows=""
+  if [ "$skip_projects" -eq 0 ]; then
+    echo
+    info "${BOLD}[2/3] Stale build directories${RESET} ${DIM}under $root, untouched >${stale_days}d${RESET}"
+    scan_projects "$root" "$stale_days" "$min_kb" "$depth"
+    proj_total="$PROJ_TOTAL"; proj_count="$PROJ_COUNT"; proj_rows="$PROJ_ROWS"
+
+    if [ -n "$proj_rows" ]; then
+      echo
+      printf '%s%12s %7s  %s%s\n' "$BOLD" "SIZE" "AGE" "PATH" "$RESET"
+      printf '%s' "$proj_rows" | sort -t'|' -k1 -rn | head -n 15 | while IFS='|' read -r kb age p; do
+        [ -n "${kb:-}" ] || continue
+        printf '%12s %6sd  %s\n' "$(human "$kb")" "$age" "${p/#$HOME/~}"
+      done
+      [ "$proj_count" -gt 15 ] && printf '%s%12s  ... and %d more%s\n' "$DIM" "" $(( proj_count - 15 )) "$RESET"
+    else
+      info "  none found"
+    fi
+  else
+    echo
+    info "${BOLD}[2/3] Stale build directories${RESET} ${DIM}skipped${RESET}"
+  fi
+
+  # --- 3. unknown cache entries --------------------------------------------
+  echo
+  info "${BOLD}[3/3] Unrecognised entries in ~/Library/Caches${RESET} ${DIM}(judge these yourself)${RESET}"
+  echo
+  local known_paths; known_paths="$(targets | cut -d'|' -f4)"
+  local unknown_total=0 kb p base
+  du -sk "$HOME"/Library/Caches/* 2>/dev/null | sort -rn | head -n 40 | while read -r kb p; do
+    printf '%s\n' "$known_paths" | grep -qxF "$p" && continue
+    [ "$kb" -ge 10240 ] || continue
+    printf '%12s %6sd  %s\n' "$(human "$kb")" "$(age_days "$p")" "$(basename "$p")"
+  done | head -n 12
+  unknown_total="$(du -sk "$HOME/Library/Caches" 2>/dev/null | awk '{print $1+0}')"
+
+  # --- verdict --------------------------------------------------------------
+  local grand=$(( cache_safe + proj_total ))
+  echo
+  printf '%s%s%s\n' "$DIM" "$(printf '%.0s=' $(seq 1 72))" "$RESET"
+  printf '%s  SUMMARY%s\n' "$BOLD" "$RESET"
+  printf '    Tool caches, safe to clear now .... %s%14s%s\n' "$GREEN" "$(human "$cache_safe")" "$RESET"
+  printf '    Tool caches, all tiers ........... %14s\n' "$(human "$cache_all")"
+  printf '    Stale build dirs (%d) ............. %s%14s%s\n' "$proj_count" "$GREEN" "$(human "$proj_total")" "$RESET"
+  printf '    ~/Library/Caches, total on disk ... %14s\n' "$(human "$unknown_total")"
+  printf '%s%s%s\n' "$DIM" "$(printf '%.0s-' $(seq 1 72))" "$RESET"
+  printf '%s    RECLAIMABLE WITHOUT THINKING ..... %s%14s%s\n' "$BOLD" "$GREEN" "$(human "$grand")" "$RESET"
+  printf '%s%s%s\n\n' "$DIM" "$(printf '%.0s=' $(seq 1 72))" "$RESET"
+
+  printf '%s  What to run, in order:%s\n\n' "$BOLD" "$RESET"
+  local step=1
+  if [ "$cache_safe" -gt 0 ]; then
+    printf '    %d. %scachectl clean --apply%s\n' "$step" "$BLUE" "$RESET"
+    printf '       %sFrees %s. Everything here regenerates on its own.%s\n\n' "$DIM" "$(human "$cache_safe")" "$RESET"
+    step=$(( step + 1 ))
+  fi
+  if [ "$proj_total" -gt 0 ]; then
+    printf '    %d. %scachectl projects --stale-days %s --apply%s\n' "$step" "$BLUE" "$stale_days" "$RESET"
+    printf '       %sFrees %s across %d dirs. Reinstall deps to get them back.%s\n\n' "$DIM" "$(human "$proj_total")" "$proj_count" "$RESET"
+    step=$(( step + 1 ))
+  fi
+  printf '    %d. %scachectl scan --stale-days 90%s\n' "$step" "$BLUE" "$RESET"
+  printf '       %sReview what you have not touched in three months.%s\n\n' "$DIM" "$RESET"
+
+  printf '%s  Nothing above has been deleted. Every command dry-runs by default.%s\n\n' "$DIM" "$RESET"
+}
+
+# ----------------------------------------------------------------------- top --
+
+# Show the biggest things in ~/Library/Caches that cachectl does NOT know about,
+# so you can decide for yourself. Read-only.
+cmd_top() {
+  local n=25 dir="$HOME/Library/Caches"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n) n="$2"; shift 2 ;;
+      --dir) dir="$2"; shift 2 ;;
+      *) die "top: unknown flag $1" ;;
+    esac
+  done
+  [ -d "$dir" ] || die "not a directory: $dir"
+
+  info "${BOLD}Largest entries in $dir${RESET} ${DIM}(read-only; nothing is deleted)${RESET}"
+  echo
+  du -sk "$dir"/* 2>/dev/null | sort -rn | head -n "$n" | while read -r kb p; do
+    printf '%12s  %6sd  %s\n' "$(human "$kb")" "$(age_days "$p")" "$(basename "$p")"
+  done
+  echo
+  printf '%sAnything here that belongs to an app you deleted is dead weight.%s\n' "$DIM" "$RESET"
+  printf '%sCaches for apps you still use will simply be rebuilt.%s\n' "$DIM" "$RESET"
+}
+
+# ---------------------------------------------------------------------- usage --
+
+usage() {
+  cat <<EOF
+${BOLD}cachectl v$VERSION${RESET} — see and reclaim developer cache space on macOS
+
+${BOLD}USAGE${RESET}
+  $SELF report [flags]       ${BOLD}Start here.${RESET} Full picture + what to run, in order
+  $SELF scan [flags]         Measure known caches and show what's reclaimable
+  $SELF clean [flags]        Remove caches (dry run unless --apply)
+  $SELF projects [flags]     Find stale node_modules/target/build dirs in your projects
+  $SELF top [flags]          List biggest entries in ~/Library/Caches (read-only)
+  $SELF list                 Print every known target and its risk tier
+  $SELF help
+
+${BOLD}REPORT${RESET}
+  --root <dir>           Where to look for project dirs (default: \$HOME)
+  --stale-days <n>       Staleness threshold for build dirs (default: 30)
+  --min-size <MB>        Minimum build dir size to report (default: 50)
+  --no-projects          Skip the project scan (much faster)
+
+${BOLD}SCAN${RESET}
+  --category <group>     node|python|rust|go|jvm|dotnet|php|ruby|apple|android|system|other
+  --only <id,id>         Restrict to specific target ids
+  --min-size <MB>        Hide anything smaller
+  --stale-days <n>       Only show caches untouched for n+ days
+  --by-age               Sort by age instead of size
+
+${BOLD}CLEAN${RESET}
+  --apply                Actually delete. Without it, nothing is touched.
+  --trash                Move to Trash instead of rm (reversible, much slower)
+  --include-review       Also clean 'review' tier (expensive to rebuild but safe)
+  --include-risky        Also clean 'risky' tier — requires --yes with --apply
+  --only <id,id>         Clean exactly these ids (implies both tiers above)
+  --yes, -y              Skip the confirmation prompt
+  plus every scan filter flag
+
+${BOLD}PROJECTS${RESET}
+  --root <dir>           Where to search (default: \$HOME)
+  --stale-days <n>       Untouched for n+ days (default: 30)
+  --min-size <MB>        Minimum size to report (default: 50)
+  --depth <n>            find maxdepth (default: 6)
+  --apply / --trash / --yes
+
+${BOLD}RISK TIERS${RESET}
+  ${GREEN}safe${RESET}    Regenerated automatically. Cleaning costs you nothing but a rebuild.
+  ${YELLOW}review${RESET}  Safe to lose, but expensive to rebuild (model weights, browser binaries).
+  ${RED}risky${RESET}   Can destroy real artifacts (Xcode archives, emulators, Docker volumes).
+          Never selected automatically.
+
+${BOLD}TYPICAL SESSION${RESET}
+  $SELF scan                            # what do I have?
+  $SELF clean                           # what would go away?
+  $SELF clean --apply                   # do it
+  $SELF projects --stale-days 60        # what's rotting in my repos?
+  $SELF projects --stale-days 60 --apply
+
+EOF
+}
+
+cmd_list() {
+  printf '%s%-24s %-9s %-7s %s%s\n' "$BOLD" "ID" "GROUP" "RISK" "PATH" "$RESET"
+  targets | while IFS='|' read -r id cat risk path cleaner desc; do
+    local c; c="$(risk_color "$risk")"
+    local mark=" "; [ -e "$path" ] && mark="*"
+    printf '%s %-23s %-9s %s%-7s%s %s\n' "$mark" "$id" "$cat" "$c" "$risk" "$RESET" "${path/#$HOME/~}"
+  done
+  echo
+  printf '%s* = present on this machine%s\n' "$DIM" "$RESET"
+}
+
+# ----------------------------------------------------------------------- main --
+
+case "${1:-help}" in
+  report)   shift; cmd_report "$@" ;;
+  scan)     shift; cmd_scan "$@" ;;
+  clean)    shift; cmd_clean "$@" ;;
+  projects) shift; cmd_projects "$@" ;;
+  top)      shift; cmd_top "$@" ;;
+  list)     shift; cmd_list "$@" ;;
+  version|--version|-V) echo "cachectl $VERSION" ;;
+  help|--help|-h) usage ;;
+  *) err "unknown command: $1"; echo; usage; exit 1 ;;
+esac

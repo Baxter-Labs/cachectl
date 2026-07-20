@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: shellcheck -s bash -S warning cachectl install.sh uninstall.sh
+
+  smoke:
+    name: smoke test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n cachectl && bash -n install.sh && bash -n uninstall.sh
+
+      - name: Commands run without error
+        run: |
+          chmod +x cachectl
+          ./cachectl help
+          ./cachectl version
+          ./cachectl list
+          ./cachectl scan --min-size 10000
+          ./cachectl top -n 5
+
+      - name: Dry run deletes nothing
+        run: |
+          mkdir -p "$HOME/.npm/_cacache/canary"
+          head -c 2000000 /dev/urandom > "$HOME/.npm/_cacache/canary/blob"
+          ./cachectl clean            # no --apply
+          test -f "$HOME/.npm/_cacache/canary/blob" || {
+            echo "FAIL: dry run deleted data"; exit 1; }
+          echo "OK: dry run left everything in place"
+
+      - name: Apply actually removes the target
+        run: |
+          ./cachectl clean --only npm --apply --yes
+          test ! -f "$HOME/.npm/_cacache/canary/blob" || {
+            echo "FAIL: --apply did not remove the cache"; exit 1; }
+          echo "OK: --apply works"
+
+      - name: Installer works
+        run: |
+          ./install.sh
+          export PATH="$HOME/.local/bin:$PATH"
+          cachectl version
+          ./uninstall.sh

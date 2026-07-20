@@ -537,7 +537,7 @@ cmd_report() {
   info "${BOLD}[3/3] Unrecognised entries in ~/Library/Caches${RESET} ${DIM}(judge these yourself)${RESET}"
   echo
   local known_paths; known_paths="$(targets | cut -d'|' -f4)"
-  local unknown_total=0 kb p base
+  local unknown_total=0
   du -sk "$HOME"/Library/Caches/* 2>/dev/null | sort -rn | head -n 40 | while read -r kb p; do
     printf '%s\n' "$known_paths" | grep -qxF "$p" && continue
     [ "$kb" -ge 10240 ] || continue

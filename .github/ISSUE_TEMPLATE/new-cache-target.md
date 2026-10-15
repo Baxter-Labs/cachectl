@@ -11,12 +11,13 @@ labels: new-target
 
 **Path on disk**
 
-<!-- e.g. ~/Library/Caches/whatever -->
+<!-- Say which OS. e.g. macOS: ~/Library/Caches/whatever · Linux: ~/.cache/whatever · Windows: %LOCALAPPDATA%\whatever -->
 
 **How big is it on your machine?**
 
 ```
-du -sh <path>
+du -sh <path>          # macOS / Linux
+cachectl top           # any OS: lists the biggest entries in your cache folder
 ```
 
 **What happens if it's deleted?**

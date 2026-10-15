@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# cachectl installer.
+# cachectl installer for macOS and Linux. (Windows: install.ps1)
 #
 # Works two ways:
 #   1. Cloned repo:  ./install.sh        (symlinks the local script)
@@ -14,7 +14,13 @@ REPO_RAW="https://raw.githubusercontent.com/eshwarpk/cachectl/main"
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-[ "$(uname -s)" = "Darwin" ] || die "cachectl is macOS-only (paths are Apple-specific)."
+OS="$(uname -s)"
+case "$OS" in
+  Darwin|Linux) ;;
+  MINGW*|MSYS*|CYGWIN*)
+    die "on Windows, install from PowerShell instead: irm $REPO_RAW/install.ps1 | iex" ;;
+  *) die "cachectl supports macOS and Linux (and Windows via install.ps1), not $OS." ;;
+esac
 
 # Locate the script: next to this installer if cloned, otherwise download it.
 SRC=""
@@ -53,7 +59,12 @@ case ":$PATH:" in
   *":$DEST:"*) ;;
   *)
     say ""
-    say "$DEST is not on your PATH yet. Add this line to ~/.zshrc:"
+    case "${SHELL##*/}" in
+      zsh)  RC="$HOME/.zshrc" ;;
+      bash) if [ "$OS" = Darwin ]; then RC="$HOME/.bash_profile"; else RC="$HOME/.bashrc"; fi ;;
+      *)    RC="your shell's startup file" ;;
+    esac
+    say "$DEST is not on your PATH yet. Add this line to $RC:"
     say "  export PATH=\"$DEST:\$PATH\""
     say "then open a new terminal."
     ;;

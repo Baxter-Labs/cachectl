@@ -23,8 +23,9 @@ paste here
 
 **Environment**
 
-- macOS version: <!-- sw_vers -productVersion -->
-- Chip: <!-- Apple Silicon / Intel -->
+- OS and version: <!-- macOS: sw_vers -productVersion · Linux: distro + version · Windows: winver -->
+- Chip: <!-- Apple Silicon / Intel / AMD / ARM -->
+- Windows only, PowerShell version: <!-- $PSVersionTable.PSVersion -->
 - `cachectl version`:
 
 ---

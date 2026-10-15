@@ -16,9 +16,37 @@ jobs:
       - name: Lint
         run: shellcheck -s bash -S warning cachectl install.sh uninstall.sh
 
+  lint-powershell:
+    name: PSScriptAnalyzer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell files are pure ASCII
+        # Windows PowerShell 5.1 reads a BOM-less script as ANSI, so anything
+        # outside ASCII would be garbled on the platform these files are for.
+        run: "! grep -nP '[^\\x00-\\x7F]' cachectl.ps1 install.ps1 uninstall.ps1"
+      - name: Lint
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          # Write-Host is deliberate: cachectl is a coloured CLI, not a cmdlet.
+          $r = foreach ($f in 'cachectl.ps1', 'install.ps1', 'uninstall.ps1') {
+            Invoke-ScriptAnalyzer -Path $f -Severity Warning, Error -ExcludeRule PSAvoidUsingWriteHost
+          }
+          $r | Format-Table -AutoSize | Out-String -Width 200
+          if ($r) { exit 1 }
+
   smoke:
-    name: smoke test (macOS)
-    runs-on: macos-latest
+    name: smoke test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+          - name: Linux
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +61,7 @@ jobs:
           ./cachectl list
           ./cachectl scan --min-size 10000
           ./cachectl top -n 5
+          ./cachectl report --no-projects
 
       - name: Dry run deletes nothing
         run: |
@@ -50,9 +79,108 @@ jobs:
             echo "FAIL: --apply did not remove the cache"; exit 1; }
           echo "OK: --apply works"
 
+      - name: Projects never follows a symlink out of node_modules
+        run: |
+          mkdir -p "$HOME/ci-projects/app/node_modules/pkg" "$HOME/ci-precious"
+          head -c 2000000 /dev/urandom > "$HOME/ci-projects/app/node_modules/pkg/index.js"
+          echo keep > "$HOME/ci-precious/keep.txt"
+          ln -s "$HOME/ci-precious" "$HOME/ci-projects/app/node_modules/linked"
+          ./cachectl projects --root "$HOME/ci-projects" --stale-days 0 --min-size 0
+          test -d "$HOME/ci-projects/app/node_modules" || {
+            echo "FAIL: dry run deleted node_modules"; exit 1; }
+          ./cachectl projects --root "$HOME/ci-projects" --stale-days 0 --min-size 0 --apply --yes
+          test ! -e "$HOME/ci-projects/app/node_modules" || {
+            echo "FAIL: --apply left node_modules"; exit 1; }
+          test -f "$HOME/ci-precious/keep.txt" || {
+            echo "FAIL: deleting node_modules followed a symlink"; exit 1; }
+          echo "OK: node_modules removed, symlink target untouched"
+
       - name: Installer works
         run: |
           ./install.sh
           export PATH="$HOME/.local/bin:$PATH"
           cachectl version
           ./uninstall.sh
+
+  smoke-windows:
+    name: smoke test (Windows, ${{ matrix.ps }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # powershell = Windows PowerShell 5.1, what every Windows box has.
+        # pwsh = PowerShell 7.
+        ps: [powershell, pwsh]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PS_EXE: ${{ matrix.ps }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Commands run without error
+        run: |
+          function cachectl { & $env:PS_EXE -NoProfile -ExecutionPolicy Bypass -File .\cachectl.ps1 @args; if ($LASTEXITCODE) { throw "cachectl $args exited $LASTEXITCODE" } }
+          cachectl help
+          cachectl version
+          cachectl list
+          cachectl scan --min-size 10000
+          cachectl top -n 5
+          cachectl report --no-projects
+
+      - name: Dry run deletes nothing
+        run: |
+          function cachectl { & $env:PS_EXE -NoProfile -ExecutionPolicy Bypass -File .\cachectl.ps1 @args; if ($LASTEXITCODE) { throw "cachectl $args exited $LASTEXITCODE" } }
+          $canary = Join-Path $env:LOCALAPPDATA 'npm-cache\_cacache\canary'
+          New-Item -ItemType Directory -Force $canary | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $canary 'blob'), (New-Object byte[] 2000000))
+          cachectl clean            # no --apply
+          if (-not (Test-Path (Join-Path $canary 'blob'))) { throw 'FAIL: dry run deleted data' }
+          'OK: dry run left everything in place'
+
+      - name: Apply actually removes the target
+        run: |
+          function cachectl { & $env:PS_EXE -NoProfile -ExecutionPolicy Bypass -File .\cachectl.ps1 @args; if ($LASTEXITCODE) { throw "cachectl $args exited $LASTEXITCODE" } }
+          cachectl clean --only npm --apply --yes
+          if (Test-Path (Join-Path $env:LOCALAPPDATA 'npm-cache\_cacache\canary')) { throw 'FAIL: --apply did not remove the cache' }
+          if (-not (Test-Path (Join-Path $env:LOCALAPPDATA 'npm-cache\_cacache'))) { throw 'FAIL: --apply removed the cache folder itself' }
+          'OK: --apply works'
+
+      - name: Projects never follows a junction, and copes with long and read-only paths
+        run: |
+          function cachectl { & $env:PS_EXE -NoProfile -ExecutionPolicy Bypass -File .\cachectl.ps1 @args; if ($LASTEXITCODE) { throw "cachectl $args exited $LASTEXITCODE" } }
+          $root = Join-Path $env:USERPROFILE 'ci-projects'
+          $nm = Join-Path $root 'app\node_modules'
+          New-Item -ItemType Directory -Force (Join-Path $nm 'pkg') | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $nm 'pkg\index.js'), (New-Object byte[] 2000000))
+          Set-ItemProperty (Join-Path $nm 'pkg\index.js') -Name IsReadOnly -Value $true
+          # Deeper than the old 260-character limit, as nested node_modules get.
+          $deep = '\\?\' + $nm + ('\' + ('d' * 50)) * 6
+          [IO.Directory]::CreateDirectory($deep) | Out-Null
+          [IO.File]::WriteAllText("$deep\leaf.js", 'x')
+          $precious = Join-Path $env:USERPROFILE 'ci-precious'
+          New-Item -ItemType Directory -Force $precious | Out-Null
+          Set-Content (Join-Path $precious 'keep.txt') 'keep'
+          New-Item -ItemType Junction -Path (Join-Path $nm 'linked') -Target $precious | Out-Null
+
+          cachectl projects --root $root --stale-days 0 --min-size 0
+          if (-not (Test-Path $nm)) { throw 'FAIL: dry run deleted node_modules' }
+          cachectl projects --root $root --stale-days 0 --min-size 0 --apply --yes
+          if (Test-Path $nm) { throw 'FAIL: --apply left node_modules' }
+          if (-not (Test-Path (Join-Path $precious 'keep.txt'))) { throw 'FAIL: deleting node_modules followed a junction' }
+          'OK: node_modules removed, junction target untouched'
+
+      - name: Installer works
+        run: |
+          $bin = Join-Path $env:LOCALAPPDATA 'cachectl\bin'
+          & $env:PS_EXE -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+          if ($LASTEXITCODE) { throw 'FAIL: install.ps1' }
+          & (Join-Path $bin 'cachectl.cmd') version
+          if ($LASTEXITCODE) { throw 'FAIL: installed launcher' }
+          if (([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') -notcontains $bin) { throw 'FAIL: bin not on user PATH' }
+          & $env:PS_EXE -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
+          if ($LASTEXITCODE) { throw 'FAIL: uninstall.ps1' }
+          if (Test-Path (Join-Path $env:LOCALAPPDATA 'cachectl')) { throw 'FAIL: uninstall left files behind' }
+          if (([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') -contains $bin) { throw 'FAIL: uninstall left the PATH entry' }
+          'OK: install and uninstall work'

@@ -17,13 +17,16 @@ id | category | risk | path | cleaner | description
 | `category` | `node`, `python`, `rust`, `go`, `jvm`, `dotnet`, `php`, `ruby`, `apple`, `android`, `system`, `other` |
 | `risk` | `safe`, `review`, or `risky` — see below |
 | `path` | Absolute path, using `$H` for `$HOME`. This is what gets measured. |
-| `cleaner` | `-` to delete the dir and recreate it empty, or a shell command to run instead |
+| `cleaner` | `-` to delete the dir and recreate it empty, or a shell command or function in the script to run instead |
 | `description` | One line. Say what the user loses, not what the tool is. |
 
 Use `cleaner` instead of `-` whenever the tool ships its own garbage collector.
 Hand-deleting a store that a package manager tracks in a separate index will
 corrupt its state — that's why `homebrew`, `go-mod`, `docker` and
 `simulator-unavailable` shell out.
+
+Check the native cleaner against a running tool first. `uv cache prune` waits
+forever behind a long-lived `uvx`, which is why `uv` has `uv_clean_idle` instead.
 
 ### Picking the risk tier
 
@@ -51,9 +54,11 @@ get back more space than they actually will.
 ## Adding a project build directory
 
 Stale build dirs are matched by name in `scan_projects()`. Add your directory
-name to the `names` list. Only add names that are unambiguously build output —
-`dist` and `build` are already borderline, and anything more generic (`out`,
-`tmp`, `data`) will eventually eat someone's source code.
+name to the `names` list. Only add names that are unambiguously build output. If
+a name is also an ordinary folder name, like `dist`, `build` and `target`, add it
+to the `case` in `regenerable_dir()` too, so it's listed only when git ignores it.
+Anything more generic (`out`, `tmp`, `data`) will eventually eat someone's source
+code.
 
 ## Safety rules, non-negotiable
 
@@ -70,13 +75,17 @@ Pull requests that weaken any of these will be closed:
 
 ```bash
 bash -n cachectl                  # syntax
-shellcheck -s bash -S warning cachectl
+shellcheck -s bash -S warning cachectl test.sh
+./test.sh                                # what gets kept and deleted, in a throwaway $HOME
 ./cachectl scan --only your-new-id
 ./cachectl clean --only your-new-id      # confirm the dry run looks right
 ```
 
-CI runs shellcheck plus a macOS smoke test that plants a canary file, verifies a
-dry run leaves it alone, and verifies `--apply` removes it.
+CI runs shellcheck, `./test.sh`, and a macOS smoke test that plants a canary file,
+verifies a dry run leaves it alone, and verifies `--apply` removes it.
+
+If you add a guard to what gets deleted, add a check to `test.sh`, then remove the
+guard and watch that check fail. A check that still passes isn't testing it.
 
 ## Scope
 

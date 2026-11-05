@@ -65,14 +65,34 @@ age_days() {
   echo $(( (NOW - m) / 86400 ))
 }
 
+# What running processes have open, name on their command line, or carry in
+# their environment (uvx puts the environment it runs from on PATH). Lines from
+# this script are dropped: its own --root would make that project look busy.
+# Fails rather than returning a partial picture, so callers can't mistake "could
+# not look" for "nothing is running".
+LIVE_PATHS=""
+load_live_paths() {
+  local open cmds
+  open="$(lsof -nPw -u "$(id -un)" -Fn 2>/dev/null | sed -n 's/^n//p')"
+  cmds="$(ps -axEww -o args= 2>/dev/null | grep -vF -- "$SELF ")"
+  [ -n "$open" ] && [ -n "$cmds" ] || return 1
+  LIVE_PATHS="$(printf '%s\n%s\n' "$open" "$cmds" | sed 's/$/ /')"
+}
+
+# Is this path, or anything under it, in LIVE_PATHS? Paths start with "/", so a
+# name beginning with a dash can't be read as a grep option. Counting, not -q:
+# -q exits on the first match, printf dies on SIGPIPE, and pipefail then reports
+# that match as "not found", which would call a running tool's files idle.
+in_use() { [ "$(printf '%s\n' "$LIVE_PATHS" | grep -cF -e "$1/" -e "$1 ")" -gt 0 ]; }
+
 # -------------------------------------------------------------------- targets --
 
 # Record layout, pipe delimited:
 #   id | category | risk | path | cleaner | description
 #
 # cleaner is "-" to mean "remove the directory and recreate it empty", or a
-# shell command to run instead (used where the tool ships its own GC and
-# deleting by hand would corrupt state).
+# shell command or function in this script to run instead (used where the tool
+# ships its own GC and deleting by hand would corrupt state).
 #
 # risk tiers:
 #   safe   - regenerated automatically, no user data, no network cost beyond redownload
@@ -92,7 +112,7 @@ electron|node|safe|$H/Library/Caches/electron|-|Electron binary downloads
 puppeteer|node|review|$H/.cache/puppeteer|-|Puppeteer Chromium builds (redownloads on next run)
 playwright|node|review|$H/Library/Caches/ms-playwright|-|Playwright browser builds (re-run 'playwright install')
 pip|python|safe|$H/Library/Caches/pip|-|pip wheel/http cache
-uv|python|safe|$H/.cache/uv|-|uv package cache
+uv|python|safe|$H/.cache/uv|uv_clean_idle|uv package cache (size shown skips what running tools use)
 poetry|python|safe|$H/Library/Caches/pypoetry|-|Poetry artifact cache
 pyenv-build|python|safe|$H/.pyenv/cache|-|pyenv source tarballs
 huggingface|python|review|$H/.cache/huggingface|-|Hugging Face model/dataset cache (large redownloads)
@@ -165,6 +185,38 @@ trash_path() {
   osascript -e "tell application \"Finder\" to delete POSIX file \"$p\"" >/dev/null 2>&1
 }
 
+# ------------------------------------------------------------------ uv cache --
+
+# uvx runs tools from inside archive-v0 and holds the cache lock for as long as
+# they run, so with a long-lived server `uv cache prune` waits forever, and
+# --force or rm -rf pulls files out from under it. Instead: entries no running
+# process uses, older than a day, because uv may still be writing anything newer.
+uv_idle_entries() {
+  local entry
+  load_live_paths || { warn "could not list running processes, keeping the uv cache"; return 1; }
+  find "$HOME/.cache/uv/archive-v0" "$HOME/.cache/uv/builds-v0" -mindepth 1 -maxdepth 1 -mtime +1d 2>/dev/null |
+    while IFS= read -r entry; do
+      in_use "$entry" || printf '%s\n' "$entry"
+    done
+}
+
+uv_idle_kb() {
+  local entry
+  uv_idle_entries | while IFS= read -r entry; do size_kb "$entry"; done | awk '{s+=$1} END {print s+0}'
+}
+
+uv_clean_idle() {
+  local entry
+  uv_idle_entries | while IFS= read -r entry; do
+    path_allowed "$entry" && rm -rf -- "$entry"
+  done
+  # With -L, only a link whose target is gone still reads as a link.
+  find -L "$HOME/.cache/uv/environments-v2" -type l 2>/dev/null | while IFS= read -r entry; do
+    path_allowed "$entry" && rm -f -- "$entry"
+  done
+  return 0
+}
+
 # ----------------------------------------------------------------------- scan --
 
 # Populates SCAN_ROWS with "id|risk|kb|age|category|desc" for matching targets.
@@ -185,7 +237,10 @@ run_scan() {
     [ -e "$path" ] || continue
 
     printf '\r%s  scanning %-34s%s' "$DIM" "$id" "$RESET" >&2
-    kb="$(size_kb "$path")"
+    case "$id" in
+      uv) kb="$(uv_idle_kb)" ;;
+      *)  kb="$(size_kb "$path")" ;;
+    esac
     age="$(age_days "$path")"
 
     [ "$kb" -ge "$min_kb" ] || continue
@@ -335,7 +390,7 @@ EOF
 
     if [ "$cleaner" != "-" ]; then
       printf '  %s->%s %s  (%s)\n' "$BLUE" "$RESET" "$id" "$cleaner"
-      if sh -c "$cleaner" >/dev/null 2>&1; then
+      if eval "$cleaner" >/dev/null 2>&1; then
         freed=$(( freed + kb ))
       else
         warn "     cleaner failed for $id, left untouched"
@@ -376,6 +431,18 @@ EOF
 # Populates PROJ_ROWS ("kb|age|path"), PROJ_TOTAL, PROJ_COUNT.
 PROJ_ROWS=""; PROJ_TOTAL=0; PROJ_COUNT=0
 
+# Could this dir be rebuilt? Tracked means it's source whatever it's called.
+# dist, build and target are also ordinary folder names, so those need git to
+# say they're ignored.
+regenerable_dir() {
+  local parent name
+  parent="$(dirname "$1")"; name="$(basename "$1")"
+  [ -z "$(git -C "$parent" ls-files -- "$name" 2>/dev/null | head -n 1)" ] || return 1
+  case "$name" in
+    dist|build|target) git -C "$parent" check-ignore -q -- "$name" 2>/dev/null ;;
+  esac
+}
+
 scan_projects() {
   local root="$1" stale_days="$2" min_kb="$3" depth="$4"
   PROJ_ROWS=""; PROJ_TOTAL=0; PROJ_COUNT=0
@@ -387,16 +454,34 @@ scan_projects() {
   done
   find_expr="${find_expr# -o }"
 
+  load_live_paths || die "could not list running processes, so can't tell what is stale"
+
   local tmp; tmp="$(mktemp -t cachectl)" || die "mktemp failed"
   # -prune stops us from descending into a match (no node_modules inside node_modules).
   # shellcheck disable=SC2086
   find "$root" -maxdepth "$depth" \( $find_expr \) -type d -prune -print 2>/dev/null > "$tmp"
 
-  local p kb age
+  # A dir's own mtime only moves when a direct child is added or removed, so a
+  # node_modules in daily use can read as months old. Stale means the project
+  # around it is quiet too: no file changed, no process inside.
+  # ponytail: the parent dir stands in for the project, so a build dir directly
+  # in a busy folder like $HOME never reads as stale. Read-only use with nothing
+  # running still reads as idle (reads don't update atime on APFS); --apply asks first.
+  local p kb age parent newest
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     age="$(age_days "$p")"
     [ "$age" -ge "$stale_days" ] || continue
+    regenerable_dir "$p" || continue
+    parent="$(dirname "$p")"
+    # shellcheck disable=SC2086
+    [ -z "$(find "$parent" \( $find_expr -o -name .git \) -prune -o -type f -mtime -"${stale_days}d" -print -quit 2>/dev/null)" ] || continue
+    in_use "$(cd "$parent" && pwd -P)" && continue
+    # shellcheck disable=SC2086
+    newest="$(find "$parent" \( $find_expr -o -name .git \) -prune -o -type f -exec stat -f %m {} + 2>/dev/null | sort -rn | head -n 1)"
+    if [ -n "$newest" ] && [ $(( (NOW - newest) / 86400 )) -lt "$age" ]; then
+      age=$(( (NOW - newest) / 86400 ))
+    fi
     printf '\r%s  measuring %-50.50s%s' "$DIM" "$(basename "$(dirname "$p")")/$(basename "$p")" "$RESET" >&2
     kb="$(size_kb "$p")"
     [ "$kb" -ge "$min_kb" ] || continue
@@ -430,34 +515,48 @@ cmd_projects() {
 
   scan_projects "$root" "$stale_days" "$min_kb" "$depth"
   local rows="$PROJ_ROWS" total="$PROJ_TOTAL" count="$PROJ_COUNT"
-  local kb age p
+  local kb age p i
 
   [ -n "$rows" ] || { info "Nothing stale enough to report."; return 0; }
 
+  # One sort, so a row's number on screen is the row --apply acts on.
+  rows="$(printf '%s' "$rows" | sort -t'|' -k1 -rn)"
+
   echo
-  printf '%s%12s %7s  %s%s\n' "$BOLD" "SIZE" "AGE" "PATH" "$RESET"
+  printf '%s%4s %12s %7s  %s%s\n' "$BOLD" "#" "SIZE" "AGE" "PATH" "$RESET"
   printf '%s%s%s\n' "$DIM" "$(printf '%.0s-' $(seq 1 90))" "$RESET"
-  printf '%s' "$rows" | sort -t'|' -k1 -rn | while IFS='|' read -r kb age p; do
-    [ -n "${kb:-}" ] || continue
-    printf '%12s %6sd  %s\n' "$(human "$kb")" "$age" "$p"
-  done
+  i=0
+  while IFS='|' read -r kb age p; do
+    i=$(( i + 1 ))
+    printf '%4d %12s %6sd  %s\n' "$i" "$(human "$kb")" "$age" "$p"
+  done <<EOF
+$rows
+EOF
   echo
   printf '%s%d dirs, %s reclaimable%s\n\n' "$BOLD" "$count" "$(human "$total")" "$RESET"
 
   if [ "$apply" -eq 0 ]; then
-    printf '%sDry run. Re-run with --apply to delete these.%s\n' "$DIM" "$RESET"
+    printf '%sDry run. Re-run with --apply to choose which to delete.%s\n' "$DIM" "$RESET"
     printf '%sNote: reinstalling deps (npm i, cargo build, ...) recreates them.%s\n' "$DIM" "$RESET"
     return 0
   fi
 
+  local picks="all"
   if [ "$assume_yes" -eq 0 ]; then
-    printf '%sDelete all %d directories above? [y/N] %s' "$BOLD" "$count" "$RESET"
-    local ans; read -r ans
-    case "$ans" in y|Y|yes|YES) ;; *) info "Aborted."; return 1 ;; esac
+    printf '%sDelete which? Numbers (1 3 5), all, or Enter to cancel: %s' "$BOLD" "$RESET"
+    read -r picks
+    case "$picks" in
+      all) ;;
+      ""|*[!0-9,\ ]*) info "Aborted, nothing deleted."; return 1 ;;
+    esac
   fi
+  picks=" $(printf '%s' "$picks" | tr ',' ' ') "
 
   local freed=0
+  i=0
   while IFS='|' read -r kb age p; do
+    i=$(( i + 1 ))
+    case "$picks" in *" all "*|*" $i "*) ;; *) continue ;; esac
     [ -n "${p:-}" ] || continue
     case "$p" in "$HOME"|/|/Users|/Users/*/) warn "  !! skipping $p"; continue ;; esac
     printf '  %s->%s %s\n' "$BLUE" "$RESET" "$p"
@@ -467,7 +566,7 @@ cmd_projects() {
       rm -rf -- "$p" && freed=$(( freed + kb )) || warn "     rm failed"
     fi
   done <<EOF
-$(printf '%s' "$rows" | sort -t'|' -k1 -rn)
+$rows
 EOF
 
   echo
@@ -640,10 +739,12 @@ ${BOLD}CLEAN${RESET}
 
 ${BOLD}PROJECTS${RESET}
   --root <dir>           Where to search (default: \$HOME)
-  --stale-days <n>       Untouched for n+ days (default: 30)
+  --stale-days <n>       No file changed in the project for n+ days (default: 30)
   --min-size <MB>        Minimum size to report (default: 50)
   --depth <n>            find maxdepth (default: 6)
-  --apply / --trash / --yes
+  --apply                Asks which rows to delete: numbers, all, or Enter to cancel
+  --trash                Move to Trash instead of rm
+  --yes, -y              With --apply: delete every listed row without asking
 
 ${BOLD}RISK TIERS${RESET}
   ${GREEN}safe${RESET}    Regenerated automatically. Cleaning costs you nothing but a rebuild.

@@ -117,16 +117,31 @@ cachectl clean --include-review --apply
 Usually the one that finds the most space.
 
 ```bash
-cachectl projects                             # $HOME, untouched 30+ days, 50 MB+
+cachectl projects                             # $HOME, quiet 30+ days, 50 MB+
 cachectl projects --root ~/code --stale-days 60
-cachectl projects --stale-days 90 --apply
+cachectl projects --stale-days 90 --apply     # asks which rows to delete
 ```
+
+`--apply` numbers the rows and asks: type `1 3 5`, `all`, or press Enter to
+cancel. Anything else deletes nothing. `--yes` deletes every row without asking.
 
 Matches `node_modules`, `.next`, `.nuxt`, `dist`, `build`, `target`, `.turbo`,
 `.parcel-cache`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`,
 `.gradle`, `DerivedData`, `vendor/bundle`, `.terraform`. Never descends into a
-match, so no nested `node_modules` noise. Only reports dirs that haven't been
-modified recently.
+match, so no nested `node_modules` noise.
+
+A dir is listed only when the project around it is quiet. A folder's own
+timestamp says little: a `node_modules` in daily use can read as months old. So:
+
+- **No file in the project changed** for `--stale-days`, and `AGE` is the last
+  time one did.
+- **No running process is inside it.** A dev server or an open shell counts, so
+  `cd` out of a project to see it listed.
+- **Git doesn't track it.** And `dist`, `build` and `target` also need git to say
+  they're ignored, because they're ordinary folder names too.
+
+Reads don't update access times on APFS, so something you only run now and then
+can still look idle. Read the list before you pick.
 
 ## What it knows about
 
@@ -162,8 +177,9 @@ This tool deletes files, so here is exactly what stops it deleting the wrong one
 - **`$HOME`, `/`, and `/Users` are hard-rejected** regardless of how a target is configured. Path traversal (`..`) is rejected.
 - **`--trash` routes through Finder**, so deletions are recoverable from the Trash.
 - **Tool-native cleaners where they exist.** `brew cleanup`, `go clean -modcache`, `docker system prune`, `xcrun simctl delete unavailable` — hand-deleting a store that a package manager indexes separately would corrupt its state.
+- **Never pulls files from under a running tool.** `uv` is the exception to the rule above: a running `uvx` executes from inside the cache and holds its lock, so `uv cache prune` waits forever and `--force` breaks the tool. `cachectl` removes only entries over a day old that no running process has open, names on its command line, or carries in its environment. If it can't list processes, it deletes nothing. That list, environments included, stays in memory and is never printed or saved.
 - **Never runs `sudo`.** Never touches anything outside your home directory. Never makes a network call of its own.
-- **CI plants a canary file** on every commit, runs a dry run, and fails the build if the canary disappears.
+- **CI plants a canary file** on every commit, runs a dry run, and fails the build if the canary disappears. `./test.sh` checks what gets kept and what gets deleted, against a throwaway `$HOME`.
 
 Two targets deliberately report a size larger than what cleaning them reclaims,
 because their cleaner is selective — `simulator-unavailable` and `docker`. Both

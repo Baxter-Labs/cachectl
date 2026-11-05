@@ -47,7 +47,7 @@ plant_uv() {
   rm -rf "$UV"
   local a="$UV/archive-v0" b="$UV/builds-v0" e="$UV/environments-v2/abc"
   dir "$a/idle"; dir "$a/-dashidle"; dir "$b/.tmpidle"
-  dir "$a/by-argv"; dir "$a/by-env"; dir "$a/by-open"; dir "$a/-dashlive"; dir "$b/.tmplive"
+  dir "$a/by-argv"; dir "$a/by-env"; dir "$a/by-open"; dir "$a/-dashlive"; dir "$b/.tmplive"; dir "$a/by-name"
   mkdir -p "$UV/wheels-v6" "$e"; touch "$UV/wheels-v6/pointer"
   ln -s "$a/idle" "$e/gone"; ln -s "$a/by-argv" "$e/kept"
   old "$UV"
@@ -62,6 +62,9 @@ sh -c 'sleep 300; :' "$UV/archive-v0/by-argv/bin/python" >/dev/null 2>&1 & backg
 sh -c 'sleep 300; :' "$UV/archive-v0/-dashlive/bin/python" >/dev/null 2>&1 & background
 sh -c 'sleep 300; :' "$UV/builds-v0/.tmplive/bin/python" >/dev/null 2>&1 & background
 ( exec 9<"$UV/archive-v0/by-open/blob"; sleep 300 ) >/dev/null 2>&1 & background
+# Mentioning this tool's name doesn't make a process this tool, as with any
+# process whose PWD or OLDPWD ends in a folder called cachectl.
+sh -c 'sleep 300; :' "$UV/archive-v0/by-name/bin/python" "cachectl x" >/dev/null 2>&1 & background
 # ps -E hides the environment of Apple's own binaries, so sh and sleep can't stand
 # in here. It needs an ordinary binary, like the Python uvx really runs.
 printf '#include <unistd.h>\nint main(void){sleep(300);return 0;}\n' | cc -x c - -o "$T/nap" 2>/dev/null
@@ -86,6 +89,7 @@ check "uv: entry with a leading dash kept"        test -e "$UV/archive-v0/-dashl
 check "uv: build entry in use kept"               test -e "$UV/builds-v0/.tmplive/blob"
 [ ! -x "$T/nap" ] || check "uv: entry on a process PATH kept" test -e "$UV/archive-v0/by-env/blob"
 check "uv: entry with a file held open kept"      test -e "$UV/archive-v0/by-open/blob"
+check "uv: entry kept when its process mentions cachectl" test -e "$UV/archive-v0/by-name/blob"
 check "uv: entry younger than a day kept"         test -e "$UV/archive-v0/fresh/blob"
 check "uv: unrelated cache buckets kept"          test -e "$UV/wheels-v6/pointer"
 check "uv: link to a removed entry dropped"       absent "$UV/environments-v2/abc/gone"

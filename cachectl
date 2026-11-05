@@ -66,17 +66,37 @@ age_days() {
 }
 
 # What running processes have open, name on their command line, or carry in
-# their environment (uvx puts the environment it runs from on PATH). Lines from
-# this script are dropped: its own --root would make that project look busy.
-# Fails rather than returning a partial picture, so callers can't mistake "could
-# not look" for "nothing is running".
+# their environment (uvx puts the environment it runs from on PATH). Fails rather
+# than returning a partial picture, so callers can't mistake "could not look" for
+# "nothing is running".
 LIVE_PATHS=""
 load_live_paths() {
   local open cmds
   open="$(lsof -nPw -u "$(id -un)" -Fn 2>/dev/null | sed -n 's/^n//p')"
-  cmds="$(ps -axEww -o args= 2>/dev/null | grep -vF -- "$SELF ")"
+  cmds="$(other_processes)"
   [ -n "$open" ] && [ -n "$cmds" ] || return 1
   LIVE_PATHS="$(printf '%s\n%s\n' "$open" "$cmds" | sed 's/$/ /')"
+}
+
+# Every process's command line and environment, minus this script and its children,
+# whose --root would make that project look busy. Dropped by process id, never by
+# text: this tool's name can sit in anyone's environment (a PWD ending in cachectl),
+# and hiding that process would delete files from under it.
+# ponytail: a wrapper like `sh -c "cachectl projects --root X; ..."` still names X, so
+# X reads as busy and isn't listed. Fails safe; exclude ancestors if anyone hits it.
+other_processes() {
+  ps -axEww -o pid=,ppid=,args= 2>/dev/null | awk -v me="$$" '
+    { pid[NR] = $1; parent[NR] = $2; line[NR] = $0 }
+    END {
+      mine[me] = 1
+      do {
+        grew = 0
+        for (i = 1; i <= NR; i++)
+          if ((parent[i] in mine) && !(pid[i] in mine)) { mine[pid[i]] = 1; grew = 1 }
+      } while (grew)
+      for (i = 1; i <= NR; i++)
+        if (!(pid[i] in mine)) print line[i]
+    }'
 }
 
 # Is this path, or anything under it, in LIVE_PATHS? Paths start with "/", so a
